@@ -81,26 +81,54 @@ def describe_page(html, label):
           f"iframes={len(soup.find_all('iframe'))}")
 
 
+SCHOOL = ""
+
+
+def mask(text):
+    """Hide the school's name (taken from the login address) in anything printed."""
+    if not SCHOOL:
+        return text
+    return re.sub(re.escape(SCHOOL), "<school>", str(text), flags=re.I)
+
+
 def peek(resp, label):
-    """Print safe facts about a response: redirects, final path, links, short page text."""
+    """Print safe facts about a response. The school name is masked."""
     from urllib.parse import urlparse
 
     chain = [str(h.status_code) for h in resp.history]
-    print(f"DEBUG [{label}]: redirects={chain} final_path={urlparse(resp.url).path!r} "
-          f"length={len(resp.text)}")
+    print(f"DEBUG [{label}]: redirects={chain} "
+          f"final_path={mask(urlparse(resp.url).path)!r} length={len(resp.text)}")
     soup = BeautifulSoup(resp.text, "html.parser")
     for m in soup.find_all("meta", attrs={"http-equiv": re.compile("refresh", re.I)}):
         content = re.sub(r"\?[^\s'\"]*", "", m.get("content") or "")
-        print(f"DEBUG [{label}]: meta refresh: {content}")
+        print(f"DEBUG [{label}]: meta refresh: {mask(content)}")
     links = []
     for a in soup.find_all("a", href=True):
         path = a["href"].split("?")[0].split("#")[0]
         if path and path not in links:
             links.append(path)
-    print(f"DEBUG [{label}]: link paths: {links[:12]}")
+    print(f"DEBUG [{label}]: link paths: {mask(links[:12])}")
+    forms = []
+    for f in soup.find_all("form"):
+        action = (f.get("action") or "").split("?")[0]
+        forms.append(f"{(f.get('method') or 'get').lower()} {action} "
+                     f"({len(f.find_all('input'))} inputs)")
+    print(f"DEBUG [{label}]: forms: {mask(forms)}")
+    names = []
+    for i in soup.find_all("input"):
+        n = i.get("name")
+        if n and n not in names:
+            names.append(n)
+    print(f"DEBUG [{label}]: input names on page: {names[:25]}")
+    msgs = []
+    for el in soup.find_all(class_=re.compile(r"validation|error|alert|danger|invalid", re.I)):
+        t = " ".join(el.get_text(" ", strip=True).split())
+        if t and t[:150] not in msgs:
+            msgs.append(t[:150])
+    print(f"DEBUG [{label}]: message boxes: {mask(msgs[:5])}")
     if len(resp.text) < 3000:
         text = " ".join(soup.get_text(" ", strip=True).split())[:300]
-        print(f"DEBUG [{label}]: short page text: {text!r}")
+        print(f"DEBUG [{label}]: short page text: {mask(text)!r}")
 
 
 def fetch_html():
@@ -108,8 +136,12 @@ def fetch_html():
 
     session = requests.Session()
     session.headers["User-Agent"] = "Mozilla/5.0 (school-calendar-sync)"
+    global SCHOOL
     login_url = os.environ["PORTAL_LOGIN_URL"].strip()
     home_url = os.environ["PORTAL_HOME_URL"].strip()
+    from urllib.parse import urlparse
+    segments = [s for s in urlparse(login_url).path.split("/") if s]
+    SCHOOL = segments[0] if segments else ""
     user = os.environ["PORTAL_USER"].strip()
     password = os.environ["PORTAL_PASS"]
 
@@ -127,8 +159,10 @@ def fetch_html():
     if method == "get":
         resp = session.get(action, params=data, timeout=30)
     else:
-        resp = session.post(action, data=data, timeout=30)
+        resp = session.post(action, data=data,
+                            headers={"Referer": login_url}, timeout=30)
     print(f"DEBUG: sign-in HTTP status {resp.status_code}")
+    print("DEBUG: cookie names now set:", sorted(c.name for c in session.cookies))
     peek(resp, "after sign-in")
 
     home = session.get(home_url, timeout=30)
@@ -153,20 +187,20 @@ def probe_for_events(session, home_url, html):
         path = m.group(1).split("?")[0]
         if path not in found and not BAD_PATH.search(path):
             found.append(path)
-    print("DEBUG: candidate paths:", found[:15])
+    print("DEBUG: candidate paths:", mask(found[:15]))
     for path in found[:8]:
         url = urljoin(home_url, path)
         try:
             r = session.get(url, timeout=30)
         except Exception as exc:  # noqa: BLE001
-            print(f"DEBUG: {path} -> error {type(exc).__name__}")
+            print(f"DEBUG: {mask(path)} -> error {type(exc).__name__}")
             continue
         ctype = r.headers.get("Content-Type", "?").split(";")[0]
-        print(f"DEBUG: {path} -> HTTP {r.status_code}, {ctype}, length {len(r.text)}, "
+        print(f"DEBUG: {mask(path)} -> HTTP {r.status_code}, {ctype}, length {len(r.text)}, "
               f"dates {len(DATE_RE.findall(r.text))}")
         events = parse_events(r.text)
         if events:
-            print(f"DEBUG: found {len(events)} events at {path}")
+            print(f"DEBUG: found {len(events)} events at {mask(path)}")
             return events
     return []
 
