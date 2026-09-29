@@ -81,6 +81,28 @@ def describe_page(html, label):
           f"iframes={len(soup.find_all('iframe'))}")
 
 
+def peek(resp, label):
+    """Print safe facts about a response: redirects, final path, links, short page text."""
+    from urllib.parse import urlparse
+
+    chain = [str(h.status_code) for h in resp.history]
+    print(f"DEBUG [{label}]: redirects={chain} final_path={urlparse(resp.url).path!r} "
+          f"length={len(resp.text)}")
+    soup = BeautifulSoup(resp.text, "html.parser")
+    for m in soup.find_all("meta", attrs={"http-equiv": re.compile("refresh", re.I)}):
+        content = re.sub(r"\?[^\s'\"]*", "", m.get("content") or "")
+        print(f"DEBUG [{label}]: meta refresh: {content}")
+    links = []
+    for a in soup.find_all("a", href=True):
+        path = a["href"].split("?")[0].split("#")[0]
+        if path and path not in links:
+            links.append(path)
+    print(f"DEBUG [{label}]: link paths: {links[:12]}")
+    if len(resp.text) < 3000:
+        text = " ".join(soup.get_text(" ", strip=True).split())[:300]
+        print(f"DEBUG [{label}]: short page text: {text!r}")
+
+
 def fetch_html():
     import requests
 
@@ -107,9 +129,11 @@ def fetch_html():
     else:
         resp = session.post(action, data=data, timeout=30)
     print(f"DEBUG: sign-in HTTP status {resp.status_code}")
+    peek(resp, "after sign-in")
 
     home = session.get(home_url, timeout=30)
     print(f"DEBUG: events page HTTP status {home.status_code}")
+    peek(home, "events page")
     return session, home.text
 
 
