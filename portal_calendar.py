@@ -4,12 +4,12 @@ Reads the "Upcoming Events" table from a PlusPortals parent page and writes
 an .ics calendar feed that Google Calendar and Apple Calendar can subscribe to.
 
 Environment variables (keep your password out of the file):
-    PORTAL_LOGIN_URL   the page where you sign in (the school's PlusPortals login)
+    PORTAL_LOGIN_URL   the page where you sign in
     PORTAL_HOME_URL    the page that shows "Upcoming Events" after login
     PORTAL_USER        your parent username
     PORTAL_PASS        your parent password
-    PORTAL_USER_FIELD  name of the username form field (default: username)
-    PORTAL_PASS_FIELD  name of the password form field (default: password)
+    PORTAL_USER_FIELD  (optional) name of the username form field
+    PORTAL_PASS_FIELD  (optional) name of the password form field
     OUTPUT_ICS         where to write the feed (default: school_events.ics)
 """
 import os
@@ -17,6 +17,7 @@ import re
 import sys
 import hashlib
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
@@ -24,20 +25,91 @@ from bs4 import BeautifulSoup
 GRADE_LABELS = {"3rd": "Fisher", "5th": "Spencer", "7th": "Tucker"}
 ALARM_HOUR = 19  # 7 PM the evening before
 
+SKIP_TYPES = {"submit", "button", "image", "reset", "file"}
+
+
+def build_login_payload(form, user, password):
+    """Fill in a login form: keep hidden fields, set username and password."""
+    data = {}
+    user_field = os.environ.get("PORTAL_USER_FIELD")
+    pass_field = os.environ.get("PORTAL_PASS_FIELD")
+    user_set = False
+    pass_set = False
+    described = []
+    for inp in form.find_all(["input", "select", "textarea"]):
+        name = inp.get("name")
+        if not name:
+            continue
+        itype = (inp.get("type") or "text").lower()
+        if itype in SKIP_TYPES:
+            continue
+        described.append(f"{name}({itype})")
+        if itype in ("checkbox", "radio"):
+            if inp.has_attr("checked"):
+                data[name] = inp.get("value", "on")
+            continue
+        if name == pass_field or (itype == "password" and not pass_set and not pass_field):
+            data[name] = password
+            pass_set = True
+        elif name == user_field or (
+            itype in ("text", "email") and not user_set and not user_field
+        ):
+            data[name] = user
+            user_set = True
+        else:
+            data[name] = inp.get("value", "")
+    print("DEBUG: login form fields:", ", ".join(described))
+    return data
+
+
+def find_login_form(soup):
+    for form in soup.find_all("form"):
+        if form.find("input", {"type": "password"}):
+            return form
+    return None
+
+
+def describe_page(html, label):
+    """Print safe facts about a page (no event names, no personal data)."""
+    soup = BeautifulSoup(html, "html.parser")
+    title = soup.title.get_text(strip=True) if soup.title else None
+    print(f"DEBUG [{label}]: title={title!r}")
+    print(f"DEBUG [{label}]: has 'Upcoming Events' text: {'Upcoming Events' in html}")
+    print(f"DEBUG [{label}]: has password box (looks like login page): "
+          f"{bool(soup.find('input', {'type': 'password'}))}")
+    print(f"DEBUG [{label}]: tables={len(soup.find_all('table'))}, "
+          f"iframes={len(soup.find_all('iframe'))}")
+
 
 def fetch_html():
     import requests
 
     session = requests.Session()
-    login_url = os.environ["PORTAL_LOGIN_URL"]
-    data = {
-        os.environ.get("PORTAL_USER_FIELD", "username"): os.environ["PORTAL_USER"],
-        os.environ.get("PORTAL_PASS_FIELD", "password"): os.environ["PORTAL_PASS"],
-    }
-    resp = session.post(login_url, data=data, timeout=30)
-    resp.raise_for_status()
-    home = session.get(os.environ["PORTAL_HOME_URL"], timeout=30)
-    home.raise_for_status()
+    session.headers["User-Agent"] = "Mozilla/5.0 (school-calendar-sync)"
+    login_url = os.environ["PORTAL_LOGIN_URL"].strip()
+    home_url = os.environ["PORTAL_HOME_URL"].strip()
+    user = os.environ["PORTAL_USER"].strip()
+    password = os.environ["PORTAL_PASS"]
+
+    page = session.get(login_url, timeout=30)
+    print(f"DEBUG: login page HTTP status {page.status_code}")
+    soup = BeautifulSoup(page.text, "html.parser")
+    form = find_login_form(soup)
+    if form is None:
+        describe_page(page.text, "login page")
+        sys.exit("Could not find a sign-in form on the login page.")
+
+    data = build_login_payload(form, user, password)
+    action = urljoin(login_url, form.get("action") or "")
+    method = (form.get("method") or "post").lower()
+    if method == "get":
+        resp = session.get(action, params=data, timeout=30)
+    else:
+        resp = session.post(action, data=data, timeout=30)
+    print(f"DEBUG: sign-in HTTP status {resp.status_code}")
+
+    home = session.get(home_url, timeout=30)
+    print(f"DEBUG: events page HTTP status {home.status_code}")
     return home.text
 
 
@@ -117,6 +189,7 @@ def main():
         html = fetch_html()
     events = parse_events(html)
     if not events:
+        describe_page(html, "events page")
         sys.exit("No events found - the page layout may have changed.")
     out = os.environ.get("OUTPUT_ICS", "school_events.ics")
     with open(out, "w", encoding="utf-8", newline="") as f:
