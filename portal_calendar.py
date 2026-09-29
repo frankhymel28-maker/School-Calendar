@@ -110,7 +110,41 @@ def fetch_html():
 
     home = session.get(home_url, timeout=30)
     print(f"DEBUG: events page HTTP status {home.status_code}")
-    return home.text
+    return session, home.text
+
+
+BAD_PATH = re.compile(r"log ?out|log ?off|sign ?out|delete|remove|edit|create|add", re.I)
+DATE_RE = re.compile(r"\d{1,2}/\d{1,2}/\d{4}|\d{4}-\d{2}-\d{2}")
+
+
+def probe_for_events(session, home_url, html):
+    """Look for the address the page loads its events from. Prints safe facts only."""
+    print("DEBUG: signed-in signs (log out link):",
+          bool(re.search(r"log ?out|log ?off|sign ?out", html, re.I)))
+    print(f"DEBUG: page length {len(html)}, script tags "
+          f"{len(BeautifulSoup(html, 'html.parser').find_all('script'))}, "
+          f"dates in page text {len(DATE_RE.findall(html))}")
+    found = []
+    for m in re.finditer(r"""["'](/[^"'\s<>]*(?:event|calendar|feed)[^"'\s<>]*)["']""", html, re.I):
+        path = m.group(1).split("?")[0]
+        if path not in found and not BAD_PATH.search(path):
+            found.append(path)
+    print("DEBUG: candidate paths:", found[:15])
+    for path in found[:8]:
+        url = urljoin(home_url, path)
+        try:
+            r = session.get(url, timeout=30)
+        except Exception as exc:  # noqa: BLE001
+            print(f"DEBUG: {path} -> error {type(exc).__name__}")
+            continue
+        ctype = r.headers.get("Content-Type", "?").split(";")[0]
+        print(f"DEBUG: {path} -> HTTP {r.status_code}, {ctype}, length {len(r.text)}, "
+              f"dates {len(DATE_RE.findall(r.text))}")
+        events = parse_events(r.text)
+        if events:
+            print(f"DEBUG: found {len(events)} events at {path}")
+            return events
+    return []
 
 
 def parse_events(html):
@@ -183,11 +217,14 @@ def build_ics(events):
 
 
 def main():
+    session = None
     if len(sys.argv) > 1:  # optional: parse a saved HTML file for testing
         html = open(sys.argv[1], encoding="utf-8").read()
     else:
-        html = fetch_html()
+        session, html = fetch_html()
     events = parse_events(html)
+    if not events and session is not None:
+        events = probe_for_events(session, os.environ["PORTAL_HOME_URL"].strip(), html)
     if not events:
         describe_page(html, "events page")
         sys.exit("No events found - the page layout may have changed.")
